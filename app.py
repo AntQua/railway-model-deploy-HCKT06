@@ -4,9 +4,8 @@ import os
 from typing import Any, Dict, Optional
 
 import joblib
-import pandas as pd
 from flask import Flask, jsonify, request
-from peewee import CharField, IntegerField, Model, TextField
+from peewee import CharField, IntegerField, Model
 from playhouse.db_url import connect
 from playhouse.shortcuts import model_to_dict
 
@@ -26,11 +25,14 @@ class CustomRailwayLogFormatter(logging.Formatter):
 def get_logger() -> logging.Logger:
     logger = logging.getLogger()
     logger.setLevel(logging.INFO)
+
     for handler in logger.handlers[:]:
         logger.removeHandler(handler)
+
     handler = logging.StreamHandler()
     handler.setFormatter(CustomRailwayLogFormatter())
     logger.addHandler(handler)
+
     return logger
 
 
@@ -44,8 +46,6 @@ app = Flask(__name__)
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite:///predictions.db")
 DB = connect(DATABASE_URL)
-
-FUTURE_MONTHS = pd.date_range(start="2025-09-01", periods=6, freq="MS")
 
 
 class BaseModel(Model):
@@ -72,19 +72,29 @@ ARTIFACTS_READY = False
 
 try:
     predictions_store = joblib.load("predictions_store.pickle")
+    logger.info("Loaded predictions_store type: %s", type(predictions_store).__name__)
 
     if Prediction.select().count() == 0:
         rows = []
-        for (code, traffic), preds in predictions_store.items():
-            for date, pred in zip(FUTURE_MONTHS, preds):
+
+        if isinstance(predictions_store, list):
+            for row in predictions_store:
                 rows.append({
-                    "date": date.strftime("%b %Y"),
-                    "port_code": int(code),
-                    "traffic": traffic,
-                    "prediction": int(pred),
-                    "true_value": None,
+                    "date": row["date"],
+                    "port_code": int(row["port_code"]),
+                    "traffic": row["traffic"],
+                    "prediction": int(row["prediction"]),
+                    "true_value": row.get("true_value"),
                 })
-        Prediction.insert_many(rows).execute()
+        else:
+            raise ValueError(
+                f"Unsupported predictions_store type: {type(predictions_store)}"
+            )
+
+        batch_size = 1000
+        for i in range(0, len(rows), batch_size):
+            Prediction.insert_many(rows[i:i + batch_size]).execute()
+
         logger.info("Inserted %s prediction rows into DB.", len(rows))
     else:
         logger.info("Predictions already in DB, skipping insert.")
@@ -101,7 +111,7 @@ except Exception as e:
 VALID_TRAFFIC = {"people", "vehicles", "containers"}
 
 
-def json_error(message: str, status: int = 422):
+def json_error(message: str, status: int):
     return jsonify({"error": message}), status
 
 
@@ -118,29 +128,37 @@ def normalize_traffic(value: Any) -> Optional[str]:
     return value if value in VALID_TRAFFIC else None
 
 
-def validate_predict_payload(payload: Dict) -> Optional[str]:
+def validate_predict_payload(payload: Dict[str, Any]) -> Optional[str]:
     missing = {"port_code", "traffic"} - payload.keys()
     if missing:
         return f"Missing required fields: {sorted(missing)}"
+
     if not isinstance(payload["port_code"], int):
         return "Field 'port_code' must be an integer."
+
     if normalize_traffic(payload["traffic"]) is None:
         return "Field 'traffic' must be one of: people, vehicles, containers."
+
     return None
 
 
-def validate_update_payload(payload: Dict) -> Optional[str]:
+def validate_update_payload(payload: Dict[str, Any]) -> Optional[str]:
     missing = {"date", "port_code", "traffic", "true_value"} - payload.keys()
     if missing:
         return f"Missing required fields: {sorted(missing)}"
+
     if not isinstance(payload["date"], str) or not payload["date"].strip():
         return "Field 'date' must be a non-empty string."
+
     if not isinstance(payload["port_code"], int):
         return "Field 'port_code' must be an integer."
+
     if normalize_traffic(payload["traffic"]) is None:
         return "Field 'traffic' must be one of: people, vehicles, containers."
+
     if not isinstance(payload["true_value"], int):
         return "Field 'true_value' must be an integer."
+
     return None
 
 
@@ -160,13 +178,13 @@ def health():
 def predict():
     payload = get_request_json()
     if payload is None:
-        return json_error("Request must contain valid JSON.")
+        return json_error("Request must contain valid JSON.", 400)
 
     logger.info("Predict request: %s", payload)
 
     error = validate_predict_payload(payload)
     if error:
-        return json_error(error)
+        return json_error(error, 422)
 
     port_code = payload["port_code"]
     traffic = normalize_traffic(payload["traffic"])
@@ -175,17 +193,31 @@ def predict():
         rows = (
             Prediction
             .select()
-            .where(Prediction.port_code == port_code, Prediction.traffic == traffic)
+            .where(
+                (Prediction.port_code == port_code) &
+                (Prediction.traffic == traffic)
+            )
             .order_by(Prediction.date)
         )
 
         if not rows.exists():
-            logger.warning("No predictions in DB for port_code=%s, traffic=%s", port_code, traffic)
-            return json_error(f"No predictions found for port_code={port_code}, traffic={traffic}.", 404)
+            logger.warning(
+                "No predictions in DB for port_code=%s, traffic=%s",
+                port_code,
+                traffic,
+            )
+            return json_error(
+                f"No predictions found for port_code={port_code}, traffic={traffic}.",
+                404,
+            )
 
         prediction = " ".join(str(r.prediction) for r in rows)
 
-        response = {"port_code": port_code, "traffic": traffic, "prediction": prediction}
+        response = {
+            "port_code": port_code,
+            "traffic": traffic,
+            "prediction": prediction,
+        }
         logger.info("Predict response: %s", response)
         return jsonify(response), 200
 
@@ -198,13 +230,13 @@ def predict():
 def update():
     payload = get_request_json()
     if payload is None:
-        return json_error("Request must contain valid JSON.")
+        return json_error("Request must contain valid JSON.", 400)
 
     logger.info("Update request: %s", payload)
 
     error = validate_update_payload(payload)
     if error:
-        return json_error(error)
+        return json_error(error, 422)
 
     date = payload["date"].strip()
     port_code = payload["port_code"]
@@ -216,18 +248,31 @@ def update():
             Prediction
             .update(true_value=true_value)
             .where(
-                Prediction.port_code == port_code,
-                Prediction.traffic == traffic,
-                Prediction.date == date,
+                (Prediction.port_code == port_code) &
+                (Prediction.traffic == traffic) &
+                (Prediction.date == date)
             )
             .execute()
         )
 
         if updated == 0:
-            logger.warning("No row found to update for port_code=%s, traffic=%s, date=%s", port_code, traffic, date)
-            return json_error(f"No prediction found for port_code={port_code}, traffic={traffic}, date={date}.", 404)
+            logger.warning(
+                "No row found to update for port_code=%s, traffic=%s, date=%s",
+                port_code,
+                traffic,
+                date,
+            )
+            return json_error(
+                f"No prediction found for port_code={port_code}, traffic={traffic}, date={date}.",
+                404,
+            )
 
-        response = {"date": date, "port_code": port_code, "traffic": traffic, "true_value": true_value}
+        response = {
+            "date": date,
+            "port_code": port_code,
+            "traffic": traffic,
+            "true_value": true_value,
+        }
         logger.info("Update saved: %s", response)
         return jsonify(response), 200
 
