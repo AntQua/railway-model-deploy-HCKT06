@@ -4,7 +4,6 @@ import os
 from typing import Any, Dict, List, Optional
 
 import joblib
-import pandas as pd
 from flask import Flask, jsonify, request
 from peewee import (
     Model,
@@ -84,30 +83,31 @@ DB.create_tables([PredictionRequest, UpdateRecord], safe=True)
 # =========================================================
 ARTIFACTS_READY = True
 columns: List[str] = []
-pipeline = None
+predictions_store = None
 
 try:
     with open("columns.json", "r", encoding="utf-8") as fh:
         columns = json.load(fh)
 
-    pipeline = joblib.load("pipeline.pickle")
-    logger.info("Model artifacts loaded successfully.")
+    predictions_store = joblib.load("predictions_store.pickle")
+    logger.info("Prediction store loaded successfully.")
+
 except FileNotFoundError as e:
     ARTIFACTS_READY = False
-    logger.warning("Model artifacts not found yet: %s", str(e))
+    logger.warning("Artifacts not found yet: %s", str(e))
+
 except Exception as e:
     ARTIFACTS_READY = False
-    logger.exception("Failed to load model artifacts: %s", str(e))
+    logger.exception("Failed to load artifacts: %s", str(e))
 
 
 # =========================================================
 # Constants / validation
 # =========================================================
 VALID_TRAFFIC = {"people", "vehicles", "containers"}
-FORECAST_MONTHS = ["Sep 2025", "Oct 2025", "Nov 2025", "Dec 2025", "Jan 2026", "Feb 2026"]
 
 
-def json_error(message: str, status_code: int = 400):
+def json_error(message: str, status_code: int):
     return jsonify({"error": message}), status_code
 
 
@@ -167,61 +167,22 @@ def validate_update_payload(payload: Dict[str, Any]) -> Optional[str]:
 
 
 # =========================================================
-# Feature builder
+# Prediction helpers
 # =========================================================
-def build_forecast_features(port_code: int, traffic: str) -> pd.DataFrame:
-    """
-    Build the 6 rows the model needs for Sep 2025 to Feb 2026.
-
-    IMPORTANT:
-    This implementation assumes your trained pipeline expects at least:
-      - port_code
-      - traffic
-      - date
-
-    If your real columns.json expects different feature names, adjust this
-    function so the returned DataFrame matches training exactly.
-    """
-    rows = []
-    for forecast_date in FORECAST_MONTHS:
-        rows.append(
-            {
-                "port_code": port_code,
-                "traffic": traffic,
-                "date": forecast_date,
-            }
-        )
-
-    df = pd.DataFrame(rows)
-
-    if columns:
-        for col in columns:
-            if col not in df.columns:
-                df[col] = None
-        df = df[columns]
-
-    return df
-
-
-def fallback_predictions(port_code: int, traffic: str) -> List[int]:
-    """
-    Safe fallback so the server does not crash if artifacts are unavailable.
-    This keeps the API responsive during setup/testing.
-    """
+def fallback_predictions(port_code: int, traffic: str) -> str:
     logger.warning(
         "Using fallback predictions for port_code=%s, traffic=%s",
         port_code,
         traffic,
     )
-    return [0, 0, 0, 0, 0, 0]
+    clean_list = [0, 0, 0, 0, 0, 0]
+    return " ".join(str(p) for p in clean_list)
 
 
-def make_predictions(port_code: int, traffic: str) -> List[int]:
-    if not ARTIFACTS_READY or pipeline is None:
-        return fallback_predictions(port_code, traffic)
-
-    features = build_forecast_features(port_code, traffic)
-    preds = pipeline.predict(features)
+def clean_prediction_list(preds: Any) -> str:
+    if not isinstance(preds, (list, tuple)):
+        clean_list = [0, 0, 0, 0, 0, 0]
+        return " ".join(str(p) for p in clean_list)
 
     cleaned = []
     for pred in preds:
@@ -232,13 +193,83 @@ def make_predictions(port_code: int, traffic: str) -> List[int]:
             cleaned.append(0)
 
     if len(cleaned) != 6:
-        logger.warning("Model returned %s predictions instead of 6.", len(cleaned))
+        logger.warning("Prediction list length is %s instead of 6.", len(cleaned))
         if len(cleaned) < 6:
             cleaned.extend([0] * (6 - len(cleaned)))
         else:
             cleaned = cleaned[:6]
 
-    return cleaned
+    return " ".join(str(p) for p in cleaned)
+
+
+def get_predictions_from_store(port_code: int, traffic: str) -> Optional[str]:
+    """
+    Tries several common key formats in case the pickle was saved
+    with tuple keys, string keys, or nested dictionaries.
+    """
+    if predictions_store is None:
+        return None
+
+    if isinstance(predictions_store, dict):
+        tuple_key = (port_code, traffic)
+        if tuple_key in predictions_store:
+            logger.info("Found predictions using tuple key: %s", tuple_key)
+            return clean_prediction_list(predictions_store[tuple_key])
+
+        str_key_underscore = f"{port_code}_{traffic}"
+        if str_key_underscore in predictions_store:
+            logger.info("Found predictions using string key: %s", str_key_underscore)
+            return clean_prediction_list(predictions_store[str_key_underscore])
+
+        str_key_dash = f"{port_code}-{traffic}"
+        if str_key_dash in predictions_store:
+            logger.info("Found predictions using string key: %s", str_key_dash)
+            return clean_prediction_list(predictions_store[str_key_dash])
+
+        str_key_pipe = f"{port_code}|{traffic}"
+        if str_key_pipe in predictions_store:
+            logger.info("Found predictions using string key: %s", str_key_pipe)
+            return clean_prediction_list(predictions_store[str_key_pipe])
+
+        nested_level_1 = predictions_store.get(port_code)
+        if isinstance(nested_level_1, dict) and traffic in nested_level_1:
+            logger.info(
+                "Found predictions using nested dict key: [%s][%s]",
+                port_code,
+                traffic,
+            )
+            return clean_prediction_list(nested_level_1[traffic])
+
+        nested_level_1 = predictions_store.get(str(port_code))
+        if isinstance(nested_level_1, dict) and traffic in nested_level_1:
+            logger.info(
+                "Found predictions using nested string dict key: [%s][%s]",
+                str(port_code),
+                traffic,
+            )
+            return clean_prediction_list(nested_level_1[traffic])
+
+    logger.warning(
+        "No predictions found in store for port_code=%s, traffic=%s",
+        port_code,
+        traffic,
+    )
+    return None
+
+
+def make_predictions(port_code: int, traffic: str) -> str:
+    if not ARTIFACTS_READY or predictions_store is None:
+        return fallback_predictions(port_code, traffic)
+
+    try:
+        preds = get_predictions_from_store(port_code, traffic)
+        if preds is None:
+            return fallback_predictions(port_code, traffic)
+        return preds
+
+    except Exception as e:
+        logger.exception("Error accessing predictions_store: %s", str(e))
+        return fallback_predictions(port_code, traffic)
 
 
 # =========================================================
@@ -268,7 +299,7 @@ def predict():
     validation_error = validate_predict_payload(payload)
     if validation_error:
         logger.warning("Predict validation error: %s", validation_error)
-        return json_error(validation_error, 400)
+        return json_error(validation_error, 422)
 
     port_code = payload["port_code"]
     traffic = normalize_traffic(payload["traffic"])
@@ -310,7 +341,7 @@ def update():
     validation_error = validate_update_payload(payload)
     if validation_error:
         logger.warning("Update validation error: %s", validation_error)
-        return json_error(validation_error, 400)
+        return json_error(validation_error, 422)
 
     date = payload["date"].strip()
     port_code = payload["port_code"]
@@ -360,4 +391,4 @@ def list_db_contents():
 # =========================================================
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    app.run(host="0.0.0.0", port=port, debug=False)
