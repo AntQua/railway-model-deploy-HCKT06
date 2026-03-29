@@ -107,7 +107,7 @@ except Exception as e:
 VALID_TRAFFIC = {"people", "vehicles", "containers"}
 
 
-def json_error(message: str, status_code: int = 400):
+def json_error(message: str, status_code: int):
     return jsonify({"error": message}), status_code
 
 
@@ -169,20 +169,20 @@ def validate_update_payload(payload: Dict[str, Any]) -> Optional[str]:
 # =========================================================
 # Prediction helpers
 # =========================================================
-def fallback_predictions(port_code: int, traffic: str) -> List[int]:
+def fallback_predictions(port_code: int, traffic: str) -> str:
     logger.warning(
         "Using fallback predictions for port_code=%s, traffic=%s",
         port_code,
         traffic,
     )
     clean_list = [0, 0, 0, 0, 0, 0]
-    return ' '.join(str(p) for p in clean_list)
+    return " ".join(str(p) for p in clean_list)
 
 
-def clean_prediction_list(preds: Any) -> List[int]:
+def clean_prediction_list(preds: Any) -> str:
     if not isinstance(preds, (list, tuple)):
         clean_list = [0, 0, 0, 0, 0, 0]
-        return ' '.join(str(p) for p in clean_list)
+        return " ".join(str(p) for p in clean_list)
 
     cleaned = []
     for pred in preds:
@@ -199,10 +199,10 @@ def clean_prediction_list(preds: Any) -> List[int]:
         else:
             cleaned = cleaned[:6]
 
-    return ' '.join(str(p) for p in cleaned)
+    return " ".join(str(p) for p in cleaned)
 
 
-def get_predictions_from_store(port_code: int, traffic: str) -> Optional[List[int]]:
+def get_predictions_from_store(port_code: int, traffic: str) -> Optional[str]:
     """
     Tries several common key formats in case the pickle was saved
     with tuple keys, string keys, or nested dictionaries.
@@ -257,7 +257,7 @@ def get_predictions_from_store(port_code: int, traffic: str) -> Optional[List[in
     return None
 
 
-def make_predictions(port_code: int, traffic: str) -> List[int]:
+def make_predictions(port_code: int, traffic: str) -> str:
     if not ARTIFACTS_READY or predictions_store is None:
         return fallback_predictions(port_code, traffic)
 
@@ -299,7 +299,7 @@ def predict():
     validation_error = validate_predict_payload(payload)
     if validation_error:
         logger.warning("Predict validation error: %s", validation_error)
-        return json_error(validation_error, 400)
+        return json_error(validation_error, 422)
 
     port_code = payload["port_code"]
     traffic = normalize_traffic(payload["traffic"])
@@ -341,7 +341,7 @@ def update():
     validation_error = validate_update_payload(payload)
     if validation_error:
         logger.warning("Update validation error: %s", validation_error)
-        return json_error(validation_error, 400)
+        return json_error(validation_error, 422)
 
     date = payload["date"].strip()
     port_code = payload["port_code"]
