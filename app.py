@@ -66,6 +66,21 @@ DB.create_tables([Prediction], safe=True)
 
 
 # =========================================================
+# Constants
+# =========================================================
+VALID_TRAFFIC = {"people", "vehicles", "containers"}
+
+MONTH_ORDER = {
+    "Sep 2025": 1,
+    "Oct 2025": 2,
+    "Nov 2025": 3,
+    "Dec 2025": 4,
+    "Jan 2026": 5,
+    "Feb 2026": 6,
+}
+
+
+# =========================================================
 # Load artifacts & seed DB
 # =========================================================
 ARTIFACTS_READY = False
@@ -108,9 +123,6 @@ except Exception as e:
 # =========================================================
 # Validation helpers
 # =========================================================
-VALID_TRAFFIC = {"people", "vehicles", "containers"}
-
-
 def json_error(message: str, status: int):
     return jsonify({"error": message}), status
 
@@ -190,17 +202,16 @@ def predict():
     traffic = normalize_traffic(payload["traffic"])
 
     try:
-        rows = (
+        rows = list(
             Prediction
             .select()
             .where(
                 (Prediction.port_code == port_code) &
                 (Prediction.traffic == traffic)
             )
-            .order_by(Prediction.date)
         )
 
-        if not rows.exists():
+        if not rows:
             logger.warning(
                 "No predictions in DB for port_code=%s, traffic=%s",
                 port_code,
@@ -211,6 +222,7 @@ def predict():
                 404,
             )
 
+        rows = sorted(rows, key=lambda r: MONTH_ORDER.get(r.date, 999))
         prediction = " ".join(str(r.prediction) for r in rows)
 
         response = {
