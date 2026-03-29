@@ -175,12 +175,14 @@ def fallback_predictions(port_code: int, traffic: str) -> List[int]:
         port_code,
         traffic,
     )
-    return [0, 0, 0, 0, 0, 0]
+    clean_list = [0, 0, 0, 0, 0, 0]
+    return ' '.join(str(p) for p in clean_list)
 
 
 def clean_prediction_list(preds: Any) -> List[int]:
     if not isinstance(preds, (list, tuple)):
-        return [0, 0, 0, 0, 0, 0]
+        clean_list = [0, 0, 0, 0, 0, 0]
+        return ' '.join(str(p) for p in clean_list)
 
     cleaned = []
     for pred in preds:
@@ -197,7 +199,7 @@ def clean_prediction_list(preds: Any) -> List[int]:
         else:
             cleaned = cleaned[:6]
 
-    return cleaned
+    return ' '.join(str(p) for p in cleaned)
 
 
 def get_predictions_from_store(port_code: int, traffic: str) -> Optional[List[int]]:
